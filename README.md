@@ -57,7 +57,3 @@ open http://localhost:9090
 ```bash
 go test -v -race ./...
 ```
-
-## License
-
-MIT
