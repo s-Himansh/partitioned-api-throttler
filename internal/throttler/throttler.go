@@ -96,6 +96,37 @@ func (t *Throttler) evictStale() {
 	}
 }
 
+// Snapshot returns a point-in-time view of all metrics.
+func (t *Throttler) Snapshot() map[string]any {
+	var totalIPs int64
+	partitions := make([]int, len(t.partitions))
+	for i, p := range t.partitions {
+		n := p.snapshotLen()
+		partitions[i] = n
+		totalIPs += int64(n)
+	}
+
+	allowed := t.totalAllowed.Load()
+	denied := t.totalDenied.Load()
+	total := allowed + denied
+	throttleRate := 0.0
+	if total > 0 {
+		throttleRate = float64(denied) / float64(total)
+	}
+
+	return map[string]any{
+		"active_ips":     totalIPs,
+		"total_allowed":  allowed,
+		"total_denied":   denied,
+		"total_requests": total,
+		"throttle_rate":  throttleRate,
+		"partitions":     partitions,
+		"num_partitions": len(t.partitions),
+		"limit":          t.limit,
+		"window_seconds": int(t.window.Seconds()),
+	}
+}
+
 func (t *Throttler) publishGauges() {
 	var totalIPs int64
 	for _, p := range t.partitions {
