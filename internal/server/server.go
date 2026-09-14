@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -81,11 +82,11 @@ func clientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		for i := 0; i < len(xff); i++ {
 			if xff[i] == ',' {
-				return xff[:i]
+				return strings.TrimSpace(xff[:i])
 			}
 		}
 
-		return xff
+		return strings.TrimSpace(xff)
 	}
 
 	host, _, err := net.SplitHostPort(r.RemoteAddr)

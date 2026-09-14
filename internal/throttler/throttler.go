@@ -15,6 +15,8 @@ type Throttler struct {
 	numPartitions uint32
 	limit         int
 	window        time.Duration
+	totalAllowed  atomic.Int64
+	totalDenied   atomic.Int64
 }
 
 // New constructs a Throttler with `numPartitions` shards.
@@ -60,8 +62,10 @@ func (t *Throttler) Allow(ip string) bool {
 
 	if allowed {
 		metrics.RequestsTotal.WithLabelValues("allowed", label).Inc()
+		t.totalAllowed.Add(1)
 	} else {
 		metrics.RequestsTotal.WithLabelValues("denied", label).Inc()
+		t.totalDenied.Add(1)
 	}
 
 	return allowed
@@ -94,18 +98,16 @@ func (t *Throttler) evictStale() {
 
 func (t *Throttler) publishGauges() {
 	var totalIPs int64
-	// Compute per-partition throttle rate from Prometheus counters.
-	for i, p := range t.partitions {
+	for _, p := range t.partitions {
 		n := p.snapshotLen()
-
-		atomic.AddInt64(&totalIPs, int64(n))
-
-		lbl := strconv.FormatUint(uint64(i), 10)
-		// Collect is invoked internally via the registry; we just refresh gauges.
-		// We can't easily read counter values back, so we maintain the gauge
-		// via the Allow() path indirectly. Here we just keep ActiveIPs updated.
-		_ = lbl
+		totalIPs += int64(n)
 	}
-
 	metrics.ActiveIPs.Set(float64(totalIPs))
+
+	allowed := t.totalAllowed.Load()
+	denied := t.totalDenied.Load()
+	total := allowed + denied
+	if total > 0 {
+		metrics.ThrottleRate.WithLabelValues("global").Set(float64(denied) / float64(total))
+	}
 }
