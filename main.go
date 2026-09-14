@@ -26,9 +26,12 @@ func main() {
 	t := throttler.New(*partitions, *limit, *window)
 	t.StartCleanup(*cleanup)
 
+	s := server.New(t)
+	s.StartBroadcaster()
+
 	srv := &http.Server{
 		Addr:         *addr,
-		Handler:      server.New(t).Handler(),
+		Handler:      s.Handler(),
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,
