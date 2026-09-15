@@ -31,19 +31,16 @@ func New(t *throttler.Throttler) *Server {
 	return &Server{throttler: t}
 }
 
-// StartBroadcaster sends metrics to all connected WebSocket clients every 500ms.
 func (s *Server) StartBroadcaster() {
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
-
 		for range ticker.C {
 			snap := s.throttler.Snapshot()
 			data, _ := json.Marshal(map[string]any{
 				"type": "metrics",
 				"data": snap,
 			})
-
 			s.wsClients.Range(func(key, value any) bool {
 				ws := key.(*websocket.Conn)
 				if err := ws.WriteMessage(websocket.TextMessage, data); err != nil {
@@ -56,14 +53,28 @@ func (s *Server) StartBroadcaster() {
 	}()
 }
 
-// returns the root HTTP handler with all routes wired up.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /api/", s.withMetrics(s.throttle(s.handleAPI)))
-	mux.HandleFunc("GET /api/echo", s.withMetrics(s.throttle(s.handleEcho)))
+	// API routes
+	mux.HandleFunc("GET /api/", s.cors(s.withMetrics(s.throttle(s.handleAPI))))
+	mux.HandleFunc("GET /api/echo", s.cors(s.withMetrics(s.throttle(s.handleEcho))))
+
+	// Dashboard data
 	mux.HandleFunc("GET /api/metrics", s.cors(s.handleMetricsSnapshot))
 	mux.HandleFunc("GET /ws", s.handleWebSocket)
+
+	// Admin API
+	mux.HandleFunc("GET /admin/whitelist", s.cors(s.handleGetWhitelist))
+	mux.HandleFunc("POST /admin/whitelist", s.cors(s.handleAddWhitelist))
+	mux.HandleFunc("DELETE /admin/whitelist", s.cors(s.handleRemoveWhitelist))
+	mux.HandleFunc("GET /admin/blacklist", s.cors(s.handleGetBlacklist))
+	mux.HandleFunc("POST /admin/blacklist", s.cors(s.handleAddBlacklist))
+	mux.HandleFunc("DELETE /admin/blacklist", s.cors(s.handleRemoveBlacklist))
+	mux.HandleFunc("GET /admin/log", s.cors(s.handleGetLog))
+	mux.HandleFunc("GET /admin/stats", s.cors(s.handleStats))
+
+	// Prometheus + health
 	mux.Handle("GET /metrics", promhttp.Handler())
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -76,8 +87,9 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) cors(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -85,6 +97,80 @@ func (s *Server) cors(next http.HandlerFunc) http.HandlerFunc {
 		next(w, r)
 	}
 }
+
+// --- Admin handlers ---
+
+func (s *Server) handleGetWhitelist(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"whitelist": s.throttler.AccessList().GetWhitelist(),
+	})
+}
+
+func (s *Server) handleAddWhitelist(w http.ResponseWriter, r *http.Request) {
+	var body struct{ IP string `json:"ip"` }
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.IP == "" {
+		http.Error(w, `{"error":"ip required"}`, http.StatusBadRequest)
+		return
+	}
+	s.throttler.AccessList().AddWhitelist(body.IP)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "added", "ip": body.IP})
+}
+
+func (s *Server) handleRemoveWhitelist(w http.ResponseWriter, r *http.Request) {
+	ip := r.URL.Query().Get("ip")
+	if ip == "" {
+		http.Error(w, `{"error":"ip required"}`, http.StatusBadRequest)
+		return
+	}
+	s.throttler.AccessList().RemoveWhitelist(ip)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "removed", "ip": ip})
+}
+
+func (s *Server) handleGetBlacklist(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"blacklist": s.throttler.AccessList().GetBlacklist(),
+	})
+}
+
+func (s *Server) handleAddBlacklist(w http.ResponseWriter, r *http.Request) {
+	var body struct{ IP string `json:"ip"` }
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.IP == "" {
+		http.Error(w, `{"error":"ip required"}`, http.StatusBadRequest)
+		return
+	}
+	s.throttler.AccessList().AddBlacklist(body.IP)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "added", "ip": body.IP})
+}
+
+func (s *Server) handleRemoveBlacklist(w http.ResponseWriter, r *http.Request) {
+	ip := r.URL.Query().Get("ip")
+	if ip == "" {
+		http.Error(w, `{"error":"ip required"}`, http.StatusBadRequest)
+		return
+	}
+	s.throttler.AccessList().RemoveBlacklist(ip)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "removed", "ip": ip})
+}
+
+func (s *Server) handleGetLog(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"log": s.throttler.RequestLog().Snapshot(100),
+	})
+}
+
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.throttler.Snapshot())
+}
+
+// --- Dashboard handlers ---
 
 func (s *Server) handleMetricsSnapshot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -97,18 +183,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Printf("websocket upgrade: %v", err)
 		return
 	}
-
 	s.wsClients.Store(conn, true)
 
-	// Send initial snapshot
 	snap := s.throttler.Snapshot()
-	data, _ := json.Marshal(map[string]any{
-		"type": "metrics",
-		"data": snap,
-	})
+	data, _ := json.Marshal(map[string]any{"type": "metrics", "data": snap})
 	_ = conn.WriteMessage(websocket.TextMessage, data)
 
-	// Read pump (detect disconnect)
 	go func() {
 		defer func() {
 			s.wsClients.Delete(conn)
@@ -122,22 +202,20 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
-// throttle is the rate-limiting middleware.
+// --- Throttle + metrics middleware ---
+
 func (s *Server) throttle(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := clientIP(r)
-
-		if !s.throttler.Allow(ip) {
+		if !s.throttler.Allow(ip, r.URL.Path) {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
-
 		next(w, r)
 	}
 }
 
-// records end-to-end latency.
 func (s *Server) withMetrics(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -165,16 +243,13 @@ func clientIP(r *http.Request) string {
 		}
 		return strings.TrimSpace(xff)
 	}
-
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
-
 	if ip := net.ParseIP(host); ip != nil {
 		return ip.String()
 	}
-
 	return host
 }
 
