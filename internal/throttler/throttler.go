@@ -3,13 +3,18 @@ package throttler
 import (
 	"hash/fnv"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"partitioned-api-throttler/internal/metrics"
 )
 
-// this is a partitioned, sliding-window rate limiter.
+type EndpointConfig struct {
+	Limit int           `json:"limit"`
+	Window time.Duration `json:"window"`
+}
+
 type Throttler struct {
 	partitions    []*Partition
 	numPartitions uint32
@@ -17,9 +22,20 @@ type Throttler struct {
 	window        time.Duration
 	totalAllowed  atomic.Int64
 	totalDenied   atomic.Int64
+	accessList    *AccessList
+	requestLog    *RequestLog
+	log           sync.Map // endpoint -> *atomic.Int64 (allowed)
+	deniedLog     sync.Map // endpoint -> *atomic.Int64 (denied)
+	adaptive      *AdaptiveConfig
 }
 
-// New constructs a Throttler with `numPartitions` shards.
+type AdaptiveConfig struct {
+	Enabled        bool
+	TargetLatencyMs float64
+	MinLimit       int
+	MaxLimit       int
+}
+
 func New(numPartitions, limit int, window time.Duration) *Throttler {
 	if numPartitions <= 0 {
 		numPartitions = 64
@@ -30,6 +46,14 @@ func New(numPartitions, limit int, window time.Duration) *Throttler {
 		numPartitions: uint32(numPartitions),
 		limit:         limit,
 		window:        window,
+		accessList:    NewAccessList(),
+		requestLog:    NewRequestLog(500),
+		adaptive: &AdaptiveConfig{
+			Enabled:         false,
+			TargetLatencyMs: 100,
+			MinLimit:        1,
+			MaxLimit:        1000,
+		},
 	}
 
 	for i := 0; i < numPartitions; i++ {
@@ -39,27 +63,58 @@ func New(numPartitions, limit int, window time.Duration) *Throttler {
 	return t
 }
 
-// returns the partition index for a given key using FNV-1a.
+func (t *Throttler) AccessList() *AccessList {
+	return t.accessList
+}
+
+func (t *Throttler) RequestLog() *RequestLog {
+	return t.requestLog
+}
+
+func (t *Throttler) SetAdaptive(cfg AdaptiveConfig) {
+	t.adaptive = &cfg
+}
+
+func (t *Throttler) GetAdaptive() AdaptiveConfig {
+	return *t.adaptive
+}
+
 func (t *Throttler) PartitionIndex(key string) uint32 {
 	h := fnv.New32a()
-
 	_, _ = h.Write([]byte(key))
-
 	return h.Sum32() % t.numPartitions
 }
 
-// Allow checks whether the IP may proceed.
-func (t *Throttler) Allow(ip string) bool {
+func (t *Throttler) Allow(ip, endpoint string) bool {
+	if t.accessList.IsBlacklisted(ip) {
+		t.totalDenied.Add(1)
+		t.requestLog.Add(RequestEntry{
+			Time: time.Now(), IP: ip, Endpoint: endpoint,
+			Status: "denied", StatusCode: 403,
+		})
+		return false
+	}
+
+	if t.accessList.IsWhitelisted(ip) {
+		t.totalAllowed.Add(1)
+		t.requestLog.Add(RequestEntry{
+			Time: time.Now(), IP: ip, Endpoint: endpoint,
+			Status: "allowed", StatusCode: 200,
+		})
+		return true
+	}
+
+	limit := t.limit
+	if t.adaptive.Enabled {
+		limit = t.computeAdaptiveLimit()
+	}
+
 	idx := t.PartitionIndex(ip)
-
 	p := t.partitions[idx]
-
-	sw := p.windowFor(ip, t.limit, t.window)
-
+	sw := p.windowFor(ip, limit, t.window)
 	allowed := sw.Allow(time.Now())
 
 	label := strconv.FormatUint(uint64(idx), 10)
-
 	if allowed {
 		metrics.RequestsTotal.WithLabelValues("allowed", label).Inc()
 		t.totalAllowed.Add(1)
@@ -68,35 +123,56 @@ func (t *Throttler) Allow(ip string) bool {
 		t.totalDenied.Add(1)
 	}
 
+	status := "denied"
+	code := 429
+	if allowed {
+		status = "allowed"
+		code = 200
+	}
+	t.requestLog.Add(RequestEntry{
+		Time: time.Now(), IP: ip, Endpoint: endpoint,
+		Status: status, StatusCode: code,
+	})
+
 	return allowed
 }
 
-// launches a background goroutine that periodically evicts
-// idle IP entries to bound memory usage.
+func (t *Throttler) computeAdaptiveLimit() int {
+	avg := t.requestLog.avgLatency()
+	if avg <= 0 {
+		return t.limit
+	}
+
+	ratio := t.adaptive.TargetLatencyMs / avg
+	newLimit := int(float64(t.limit) * ratio)
+
+	if newLimit < t.adaptive.MinLimit {
+		newLimit = t.adaptive.MinLimit
+	}
+	if newLimit > t.adaptive.MaxLimit {
+		newLimit = t.adaptive.MaxLimit
+	}
+	return newLimit
+}
+
 func (t *Throttler) StartCleanup(interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
-
 		defer ticker.Stop()
-
 		for range ticker.C {
 			t.evictStale()
-
 			t.publishGauges()
 		}
 	}()
 }
 
 func (t *Throttler) evictStale() {
-	// Give IPs a grace period equal to the window before eviction.
 	grace := t.window
-
 	for _, p := range t.partitions {
 		_ = p.evictIfStale(grace)
 	}
 }
 
-// Snapshot returns a point-in-time view of all metrics.
 func (t *Throttler) Snapshot() map[string]any {
 	var totalIPs int64
 	partitions := make([]int, len(t.partitions))
@@ -114,6 +190,11 @@ func (t *Throttler) Snapshot() map[string]any {
 		throttleRate = float64(denied) / float64(total)
 	}
 
+	var avgLatency float64
+	if t.requestLog != nil {
+		avgLatency = t.requestLog.avgLatency()
+	}
+
 	return map[string]any{
 		"active_ips":     totalIPs,
 		"total_allowed":  allowed,
@@ -124,6 +205,11 @@ func (t *Throttler) Snapshot() map[string]any {
 		"num_partitions": len(t.partitions),
 		"limit":          t.limit,
 		"window_seconds": int(t.window.Seconds()),
+		"avg_latency_ms": avgLatency,
+		"adaptive":       t.adaptive.Enabled,
+		"whitelist":      t.accessList.GetWhitelist(),
+		"blacklist":      t.accessList.GetBlacklist(),
+		"log":            t.requestLog.Snapshot(50),
 	}
 }
 

@@ -10,12 +10,12 @@ func TestThrottler_AllowBasic(t *testing.T) {
 	th := New(4, 3, time.Minute)
 
 	for i := 0; i < 3; i++ {
-		if !th.Allow("1.2.3.4") {
+		if !th.Allow("1.2.3.4", "/api/test") {
 			t.Fatalf("request %d should be allowed", i)
 		}
 	}
 
-	if th.Allow("1.2.3.4") {
+	if th.Allow("1.2.3.4", "/api/test") {
 		t.Fatal("should be denied after limit")
 	}
 }
@@ -23,14 +23,14 @@ func TestThrottler_AllowBasic(t *testing.T) {
 func TestThrottler_DifferentIPsAreIndependent(t *testing.T) {
 	th := New(4, 2, time.Minute)
 
-	th.Allow("1.1.1.1")
-	th.Allow("1.1.1.1")
+	th.Allow("1.1.1.1", "/api/test")
+	th.Allow("1.1.1.1", "/api/test")
 
-	if th.Allow("1.1.1.1") {
+	if th.Allow("1.1.1.1", "/api/test") {
 		t.Fatal("IP1 should be denied")
 	}
 
-	if !th.Allow("2.2.2.2") {
+	if !th.Allow("2.2.2.2", "/api/test") {
 		t.Fatal("IP2 should be allowed")
 	}
 }
@@ -38,11 +38,11 @@ func TestThrottler_DifferentIPsAreIndependent(t *testing.T) {
 func TestThrottler_WindowExpiry(t *testing.T) {
 	th := New(4, 1, time.Millisecond)
 
-	th.Allow("1.2.3.4")
+	th.Allow("1.2.3.4", "/api/test")
 
 	time.Sleep(5 * time.Millisecond)
 
-	if !th.Allow("1.2.3.4") {
+	if !th.Allow("1.2.3.4", "/api/test") {
 		t.Fatal("should be allowed after window expires")
 	}
 }
@@ -64,9 +64,9 @@ func TestThrottler_PartitionDistribution(t *testing.T) {
 func TestThrottler_MetricsTracked(t *testing.T) {
 	th := New(4, 2, time.Minute)
 
-	th.Allow("1.2.3.4")
-	th.Allow("1.2.3.4")
-	th.Allow("1.2.3.4") // denied
+	th.Allow("1.2.3.4", "/api/test")
+	th.Allow("1.2.3.4", "/api/test")
+	th.Allow("1.2.3.4", "/api/test") // denied
 
 	allowed := th.totalAllowed.Load()
 	denied := th.totalDenied.Load()
@@ -91,7 +91,7 @@ func TestThrottler_ConcurrentAllow(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 10; j++ {
-				allowed <- th.Allow("1.2.3.4")
+				allowed <- th.Allow("1.2.3.4", "/api/test")
 			}
 		}()
 	}
