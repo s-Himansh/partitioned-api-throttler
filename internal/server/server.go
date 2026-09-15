@@ -57,31 +57,37 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	// API routes
-	mux.HandleFunc("GET /api/", s.cors(s.withMetrics(s.throttle(s.handleAPI))))
-	mux.HandleFunc("GET /api/echo", s.cors(s.withMetrics(s.throttle(s.handleEcho))))
+	mux.HandleFunc("/api/", s.withMetrics(s.throttle(s.handleAPI)))
+	mux.HandleFunc("/api/echo", s.withMetrics(s.throttle(s.handleEcho)))
 
 	// Dashboard data
-	mux.HandleFunc("GET /api/metrics", s.cors(s.handleMetricsSnapshot))
-	mux.HandleFunc("GET /ws", s.handleWebSocket)
+	mux.HandleFunc("/api/metrics", s.handleMetricsSnapshot)
+	mux.HandleFunc("/ws", s.handleWebSocket)
 
 	// Admin API
-	mux.HandleFunc("GET /admin/whitelist", s.cors(s.handleGetWhitelist))
-	mux.HandleFunc("POST /admin/whitelist", s.cors(s.handleAddWhitelist))
-	mux.HandleFunc("DELETE /admin/whitelist", s.cors(s.handleRemoveWhitelist))
-	mux.HandleFunc("GET /admin/blacklist", s.cors(s.handleGetBlacklist))
-	mux.HandleFunc("POST /admin/blacklist", s.cors(s.handleAddBlacklist))
-	mux.HandleFunc("DELETE /admin/blacklist", s.cors(s.handleRemoveBlacklist))
-	mux.HandleFunc("GET /admin/log", s.cors(s.handleGetLog))
-	mux.HandleFunc("GET /admin/stats", s.cors(s.handleStats))
+	mux.HandleFunc("/admin/whitelist", s.handleAdminWhitelist)
+	mux.HandleFunc("/admin/blacklist", s.handleAdminBlacklist)
+	mux.HandleFunc("/admin/log", s.handleGetLog)
+	mux.HandleFunc("/admin/stats", s.handleStats)
 
 	// Prometheus + health
-	mux.Handle("GET /metrics", promhttp.Handler())
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) cors(next http.HandlerFunc) http.HandlerFunc {
@@ -100,62 +106,56 @@ func (s *Server) cors(next http.HandlerFunc) http.HandlerFunc {
 
 // --- Admin handlers ---
 
-func (s *Server) handleGetWhitelist(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAdminWhitelist(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"whitelist": s.throttler.AccessList().GetWhitelist(),
-	})
-}
-
-func (s *Server) handleAddWhitelist(w http.ResponseWriter, r *http.Request) {
-	var body struct{ IP string `json:"ip"` }
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.IP == "" {
-		http.Error(w, `{"error":"ip required"}`, http.StatusBadRequest)
-		return
+	switch r.Method {
+	case http.MethodGet:
+		_ = json.NewEncoder(w).Encode(map[string]any{"whitelist": s.throttler.AccessList().GetWhitelist()})
+	case http.MethodPost:
+		var body struct{ IP string `json:"ip"` }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.IP == "" {
+			http.Error(w, `{"error":"ip required"}`, http.StatusBadRequest)
+			return
+		}
+		s.throttler.AccessList().AddWhitelist(body.IP)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "added", "ip": body.IP})
+	case http.MethodDelete:
+		ip := r.URL.Query().Get("ip")
+		if ip == "" {
+			http.Error(w, `{"error":"ip required"}`, http.StatusBadRequest)
+			return
+		}
+		s.throttler.AccessList().RemoveWhitelist(ip)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "removed", "ip": ip})
+	default:
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 	}
-	s.throttler.AccessList().AddWhitelist(body.IP)
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "added", "ip": body.IP})
 }
 
-func (s *Server) handleRemoveWhitelist(w http.ResponseWriter, r *http.Request) {
-	ip := r.URL.Query().Get("ip")
-	if ip == "" {
-		http.Error(w, `{"error":"ip required"}`, http.StatusBadRequest)
-		return
+func (s *Server) handleAdminBlacklist(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	switch r.Method {
+	case http.MethodGet:
+		_ = json.NewEncoder(w).Encode(map[string]any{"blacklist": s.throttler.AccessList().GetBlacklist()})
+	case http.MethodPost:
+		var body struct{ IP string `json:"ip"` }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.IP == "" {
+			http.Error(w, `{"error":"ip required"}`, http.StatusBadRequest)
+			return
+		}
+		s.throttler.AccessList().AddBlacklist(body.IP)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "added", "ip": body.IP})
+	case http.MethodDelete:
+		ip := r.URL.Query().Get("ip")
+		if ip == "" {
+			http.Error(w, `{"error":"ip required"}`, http.StatusBadRequest)
+			return
+		}
+		s.throttler.AccessList().RemoveBlacklist(ip)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "removed", "ip": ip})
+	default:
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 	}
-	s.throttler.AccessList().RemoveWhitelist(ip)
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "removed", "ip": ip})
-}
-
-func (s *Server) handleGetBlacklist(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"blacklist": s.throttler.AccessList().GetBlacklist(),
-	})
-}
-
-func (s *Server) handleAddBlacklist(w http.ResponseWriter, r *http.Request) {
-	var body struct{ IP string `json:"ip"` }
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.IP == "" {
-		http.Error(w, `{"error":"ip required"}`, http.StatusBadRequest)
-		return
-	}
-	s.throttler.AccessList().AddBlacklist(body.IP)
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "added", "ip": body.IP})
-}
-
-func (s *Server) handleRemoveBlacklist(w http.ResponseWriter, r *http.Request) {
-	ip := r.URL.Query().Get("ip")
-	if ip == "" {
-		http.Error(w, `{"error":"ip required"}`, http.StatusBadRequest)
-		return
-	}
-	s.throttler.AccessList().RemoveBlacklist(ip)
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "removed", "ip": ip})
 }
 
 func (s *Server) handleGetLog(w http.ResponseWriter, r *http.Request) {
